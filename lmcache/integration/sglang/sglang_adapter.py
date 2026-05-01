@@ -26,6 +26,55 @@ from lmcache.v1.metadata import LMCacheMetadata
 logger = init_logger(__name__)
 
 
+def resolve_sglang_kv_pools(
+    *,
+    token_to_kv_pool_allocator: Any | None = None,
+    kvcache: Any | None = None,
+    k_pool: List[torch.Tensor] | None = None,
+    v_pool: List[torch.Tensor] | None = None,
+) -> tuple[List[torch.Tensor], List[torch.Tensor]]:
+    """Resolve SGLang K/V pool tensor lists from any of: explicit
+    ``k_pool``/``v_pool``; the live ``kvcache`` object's public
+    ``k_buffer``/``v_buffer`` attributes; or the legacy private
+    ``_kvcache`` attribute on the allocator.
+    """
+    if k_pool is not None or v_pool is not None:
+        if k_pool is None or v_pool is None:
+            raise ValueError("Both k_pool and v_pool must be provided together")
+        return k_pool, v_pool
+
+    def _get(attr_name: str) -> List[torch.Tensor]:
+        if kvcache is not None and hasattr(kvcache, attr_name):
+            buffer = getattr(kvcache, attr_name)
+        else:
+            legacy_kvcache = getattr(token_to_kv_pool_allocator, "_kvcache", None)
+            if legacy_kvcache is not None and hasattr(legacy_kvcache, attr_name):
+                buffer = getattr(legacy_kvcache, attr_name)
+            else:
+                buffer = None
+        if buffer is None and token_to_kv_pool_allocator is not None:
+            get_kvcache = getattr(token_to_kv_pool_allocator, "get_kvcache", None)
+            if callable(get_kvcache):
+                active_kvcache = get_kvcache()
+                if active_kvcache is not None and hasattr(active_kvcache, attr_name):
+                    buffer = getattr(active_kvcache, attr_name)
+        if buffer is None:
+            raise ValueError(
+                "Unsupported SGLang KV cache layout for LMCache. "
+                f"Missing `{attr_name}` on the active KV cache."
+            )
+        if not isinstance(buffer, list | tuple) or not all(
+            isinstance(tensor, torch.Tensor) for tensor in buffer
+        ):
+            raise TypeError(
+                f"Expected `{attr_name}` to be a sequence of torch.Tensor values, "
+                f"got {type(buffer)}"
+            )
+        return list(buffer)
+
+    return _get("k_buffer"), _get("v_buffer")
+
+
 @dataclass
 class StoreMetadata:
     last_node: Any
